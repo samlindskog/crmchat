@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Dict, List
 from ratelimit import limits, sleep_and_retry
 from pyairtable.exceptions import PyAirtableError
+import re
+import idna
 
 import pandas as pd
 from pyairtable import Api
@@ -94,20 +96,20 @@ class AirtableSync:
         logger.info(f"Error wait time set to: {self.error_wait} seconds")
         logger.debug(f"Log level set to: {log_level}")
     
-    def _make_api_call(self, table_name: str) -> List[Dict]:
+    def _make_api_call(self, table_name: str) -> List[List[Dict]]:
         """Make an API call to Airtable with rate limiting."""
         table = self.base.table(table_name)
-        records = []
+        records = []  # List of pages, where each page is a list of records
         
         # Use iterate() to fetch records one page at a time
         for page in table.iterate():
             self.rate_limiter.wait()  # Rate limit each page fetch
-            records.extend(page)
+            records.append(page)  # Store each page as a separate element
             logger.debug(f"Fetched {len(page)} records from page")
         
         return records
     
-    def get_table_data(self, table_name: str) -> List[Dict]:
+    def get_table_data(self, table_name: str) -> List[List[Dict]]:
         """Fetch all records from a specific Airtable table with rate limiting."""
         try:
             records = self._make_api_call(table_name)
@@ -122,26 +124,52 @@ class AirtableSync:
             logger.error(f"Unexpected error fetching data from table {table_name}: {str(e)}")
             return []
     
-    def save_to_csv(self, table_name: str, records: List[Dict]):
+    def clean_text(self, text: str) -> str:
+        """Remove unwanted symbols from text."""
+        if not isinstance(text, str):
+            return str(text)
+        
+        # Then keep only allowed characters
+        cleaned = re.sub(r'[^a-zA-Z0-9,!?;:\.\'\"\(\)\s@<>_#=+%&~$*\-\/\[\]]', '', text)
+        
+        return cleaned
+
+    def save_to_csv(self, table_name: str, records_pages: List[List[Dict]]):
         """Save records to a CSV file, overwriting if it exists."""
-        if not records:
+        if not records_pages:
             logger.warning(f"No records to save for table {table_name}")
             return
         
-        # Convert records to DataFrame
-        df = pd.DataFrame([record['fields'] for record in records])
+        # Create a list to hold all records
+        all_records = []
+        for page in records_pages:
+            for record in page:
+                # Ensure all values are strings and clean non-English characters
+                fields = {k: self.clean_text(v) if isinstance(v, (str,list)) else '' for k, v in record['fields'].items()}
+                all_records.append(fields)
         
-        # Add record ID and created/updated timestamps
-        df['record_id'] = [record['id'] for record in records]
-        df['created_time'] = [record['createdTime'] for record in records]
+        # Convert to DataFrame with explicit column order
+        if all_records:
+            # Get all unique keys from all records
+            columns = sorted(set().union(*(d.keys() for d in all_records)))
+            df = pd.DataFrame(all_records, columns=columns)
+        else:
+            df = pd.DataFrame()
         
         # Use a fixed filename for each table
         filename = self.output_dir / f"{table_name}.csv"
         
-        # Save to CSV, overwriting if it exists
-        df.to_csv(filename, index=False)
-        logger.info(f"Updated {len(records)} records in {filename}")
-        logger.debug(f"CSV columns: {', '.join(df.columns)}")
+        # Save to CSV with strict formatting options
+        df.to_csv(
+            filename,
+            index=False,
+            quoting=1,  # Quote all non-numeric fields
+            escapechar='\\',  # Use backslash as escape character
+            doublequote=True,  # Double up quotes to escape them
+            lineterminator='\n',  # Use Unix-style line endings
+            na_rep=''  # Replace NaN with empty string
+        )
+        logger.info(f"Updated {len(all_records)} records in {filename}")
     
     def sync_table(self, table_name: str):
         """Sync a single table from Airtable to CSV."""
@@ -151,8 +179,12 @@ class AirtableSync:
     
     def sync_all_tables(self):
         """Sync all configured tables from Airtable to CSV."""
+        start_time = time.time()
         for table_name in self.tables:
             self.sync_table(table_name)
+        end_time = time.time()
+        duration = end_time - start_time
+        logger.info(f"Sync completed in {duration:.2f} seconds")
 
 def main():
     try:
