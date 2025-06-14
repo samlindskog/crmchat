@@ -146,12 +146,19 @@ class AirtableSync:
             for record in page:
                 # Ensure all values are strings and clean non-English characters
                 fields = {k: self.clean_text(v) if isinstance(v, (str,list)) else '' for k, v in record['fields'].items()}
+                # Add Airtable record ID and table name
+                fields['airtable_record_id'] = record['id']
+                fields['airtable_table'] = table_name
                 all_records.append(fields)
         
         # Convert to DataFrame with explicit column order
         if all_records:
             # Get all unique keys from all records
             columns = sorted(set().union(*(d.keys() for d in all_records)))
+            # Ensure airtable_record_id and airtable_table are first columns
+            priority_columns = ['airtable_record_id', 'airtable_table']
+            other_columns = [col for col in columns if col not in priority_columns]
+            columns = priority_columns + other_columns
             df = pd.DataFrame(all_records, columns=columns)
         else:
             df = pd.DataFrame()
