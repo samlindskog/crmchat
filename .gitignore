@@ -37,7 +37,7 @@ ENV/
 *.log
 
 # Local development
-csv_output/
+airtable_sync/csv_output/
 *.csv
 
 # Docker
