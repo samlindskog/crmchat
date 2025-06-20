@@ -9,6 +9,7 @@ from ratelimit import limits, sleep_and_retry
 from pyairtable.exceptions import PyAirtableError
 import re
 import idna
+import requests
 
 import pandas as pd
 from pyairtable import Api
@@ -31,6 +32,7 @@ Environment Variables:
         AIRTABLE_SYNC_LOG_LEVEL Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL) (default: INFO)
         AIRTABLE_RATE_LIMIT   Maximum requests per second (default: 5)
         AIRTABLE_ERROR_WAIT   Seconds to wait after API error (default: 35)
+        PERPLEXITY_API_KEY    Your Perplexity AI API key
 
 Example:
     AIRTABLE_API_KEY=key123 AIRTABLE_BASE_ID=base456 AIRTABLE_SYNC_LOG_LEVEL=DEBUG python airtable_sync.py
@@ -79,6 +81,8 @@ class AirtableSync:
         self.tables = os.getenv('AIRTABLE_TABLES', 'Table1,Table2').split(',')
         self.rate_limit = float(os.getenv('AIRTABLE_RATE_LIMIT', '5'))  # requests per second
         self.error_wait = int(os.getenv('AIRTABLE_ERROR_WAIT', '35'))  # seconds
+        self.perplexity_api_key = os.getenv('PERPLEXITY_API_KEY')
+        self.test_mode = os.getenv('AIRTABLE_TEST_MODE', '').lower() in ['1', 'true']
         
         if not self.api_key or not self.base_id:
             raise ValueError("AIRTABLE_API_KEY and AIRTABLE_BASE_ID must be set in environment")
@@ -95,18 +99,33 @@ class AirtableSync:
         logger.info(f"Rate limit set to: {self.rate_limit} requests per second")
         logger.info(f"Error wait time set to: {self.error_wait} seconds")
         logger.debug(f"Log level set to: {log_level}")
+        logger.info(f"Test mode: {'ENABLED' if self.test_mode else 'disabled'}")
+        
+        if not self.perplexity_api_key:
+            logger.warning('PERPLEXITY_API_KEY not set. LinkedIn summaries will be skipped.')
     
     def _make_api_call(self, table_name: str) -> List[List[Dict]]:
         """Make an API call to Airtable with rate limiting."""
         table = self.base.table(table_name)
         records = []  # List of pages, where each page is a list of records
-        
+        total_records = 0
         # Use iterate() to fetch records one page at a time
         for page in table.iterate():
             self.rate_limiter.wait()  # Rate limit each page fetch
-            records.append(page)  # Store each page as a separate element
-            logger.debug(f"Fetched {len(page)} records from page")
-        
+            if self.test_mode:
+                # Only collect up to 3 records in test mode
+                remaining = 3 - total_records
+                if remaining <= 0:
+                    break
+                if len(page) > remaining:
+                    records.append(page[:remaining])
+                    total_records += remaining
+                    break
+                else:
+                    records.append(page)
+                    total_records += len(page)
+            else:
+                records.append(page)  # Store each page as a separate element
         return records
     
     def get_table_data(self, table_name: str) -> List[List[Dict]]:
@@ -177,12 +196,87 @@ class AirtableSync:
             na_rep=''  # Replace NaN with empty string
         )
         logger.info(f"Updated {len(all_records)} records in {filename}")
-    
+
+    def summarize_with_perplexity(self, linkedin_url: str, first_name: str = '', last_name: str = '') -> str:
+        """Send the LinkedIn URL and name to Perplexity AI for summarization."""
+        if not self.perplexity_api_key or not linkedin_url:
+            return 'Summary not available.'
+        try:
+            api_url = 'https://api.perplexity.ai/chat/completions'
+            headers = {
+                'Authorization': f'Bearer {self.perplexity_api_key}',
+                'Content-Type': 'application/json',
+            }
+            name_part = f" for {first_name} {last_name}".strip() if first_name or last_name else ''
+            prompt = f'summarize professional history in up to 250 words{name_part}. {linkedin_url}. strictly provide only the final answer, I do not want any explanation or steps or context'
+            data = {
+                'model': 'sonar-reasoning-pro',
+                'messages': [
+                    {'role': 'system', 'content': 'strictly provide only the final answer, I do not want any explanation or steps or context'},
+                    {'role': 'user', 'content': prompt}
+                ],
+                'search_domain_filter': [
+                    f'{linkedin_url}'
+                ]
+            }
+            resp = requests.post(api_url, headers=headers, json=data, timeout=90)
+            if resp.status_code == 200:
+                result = resp.json()
+                return result.get('choices', [{}])[0].get('message', {}).get('content', 'Summary not available.')
+            else:
+                logger.warning(f"Perplexity API error: {resp.status_code} {resp.text}")
+                return 'Summary not available.'
+        except Exception as e:
+            logger.warning(f"Exception calling Perplexity API: {e}")
+            return 'Summary not available.'
+
+    def save_to_plaintext(self, table_name: str, records_pages: List[List[Dict]]):
+        """Save records from a specific table to a plaintext file."""
+        if table_name != 'tblgitdXggPeL7cqD':
+            return
+            
+        if not records_pages:
+            logger.warning(f"No records to save to plaintext for table {table_name}")
+            return
+
+        all_records = []
+        for page in records_pages:
+            for record in page:
+                fields = {k: self.clean_text(v) if isinstance(v, (str,list)) else '' for k, v in record['fields'].items()}
+                all_records.append(fields)
+
+        plaintext_content = ""
+        for idx, record in enumerate(all_records):
+            for column, value in record.items():
+                plaintext_content += f"### {column} ###\n{value}\n"
+            # LinkedIn summary section
+            linkedin_url = record.get('LinkedIn Profile', '')
+            if isinstance(linkedin_url, list):
+                linkedin_url = linkedin_url[0] if linkedin_url else ''
+            linkedin_url = str(linkedin_url).strip()
+            first_name = str(record.get('First Name', '')).strip()
+            last_name = str(record.get('Last Name', '')).strip()
+            if linkedin_url.lower().startswith('http'):
+                summary = self.summarize_with_perplexity(linkedin_url, first_name, last_name)
+            else:
+                summary = 'No LinkedIn URL provided.'
+            plaintext_content += f"### LinkedIn Summary ###\n{summary}\n"
+            # Add separator if not the last record
+            if idx < len(all_records) - 1:
+                plaintext_content += "---\n"
+
+        filename = self.output_dir / f"{table_name}.txt"
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(plaintext_content)
+        
+        logger.info(f"Saved {len(all_records)} records to plaintext file {filename}")
+
     def sync_table(self, table_name: str):
         """Sync a single table from Airtable to CSV."""
         logger.info(f"Syncing table: {table_name}")
         records = self.get_table_data(table_name)
         self.save_to_csv(table_name, records)
+        self.save_to_plaintext(table_name, records)
     
     def sync_all_tables(self):
         """Sync all configured tables from Airtable to CSV."""
