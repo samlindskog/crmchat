@@ -9,8 +9,13 @@ pandas = "*"
 python-dotenv = "*"
 schedule = "*"
 ratelimit = "*"
+beautifulsoup4 = "*"
+httpx = "*"
 
 [dev-packages]
 
 [requires]
 python_version = "3.11"
+
+[pipenv]
+allow_prereleases = true

@@ -44,5 +44,5 @@ airtable_sync/csv_output/
 .docker/
 docker-compose.override.yml
 
-./chain/vectorstore/
-./chain/vectorstore/*
+chain/vectorstore/
+chain/vectorstore/*
