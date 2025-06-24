@@ -17,6 +17,11 @@ import pandas as pd
 from pyairtable import Api
 import schedule
 
+from config import Config
+
+# Set up logging and create logger for this file
+logger = logging.getLogger(__name__)
+
 def show_help():
     parser = argparse.ArgumentParser(
         description='Sync Airtable data to CSV files',
@@ -26,11 +31,11 @@ Environment Variables:
     Required:
         AIRTABLE_API_KEY      Your Airtable API key
         AIRTABLE_BASE_ID      Your Airtable base ID
+        AIRTABLE_TABLES       Comma-separated list of tables to sync
 
     Optional:
         AIRTABLE_OUTPUT_DIR   Directory to save CSV files (default: csv_output)
         AIRTABLE_SYNC_INTERVAL Sync interval in minutes (default: 60)
-        AIRTABLE_TABLES       Comma-separated list of tables to sync (default: Table1,Table2)
         AIRTABLE_SYNC_LOG_LEVEL Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL) (default: INFO)
         AIRTABLE_RATE_LIMIT   Maximum requests per second (default: 5)
         AIRTABLE_ERROR_WAIT   Seconds to wait after API error (default: 35)
@@ -39,102 +44,167 @@ Environment Variables:
 ''')
     parser.parse_args()
 
-# Set up logging with configurable level
-log_level = os.getenv('AIRTABLE_SYNC_LOG_LEVEL', 'INFO').upper()
-numeric_level = getattr(logging, log_level, None)
-if not isinstance(numeric_level, int):
-    raise ValueError(f'Invalid log level: {log_level}')
+class AirtableExporter:
+    def __init__(self, config):
+        self.config = config
+        self.fetcher = self.AirtableFetcher(self.config)
+        self.output_dir = self.config.AIRTABLE_OUTPUT_DIR
+        self.xai_api_key = self.config.XAI_API_KEY
 
-logging.basicConfig(
-    level=numeric_level,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+    class AirtableFetcher:
+        def __init__(self, config):
+            # Validate required environment variables
+            config.validate_required()
+            
+            # Use configuration from Config class
+            self.api_key = config.AIRTABLE_API_KEY
+            self.base_id = config.AIRTABLE_BASE_ID
+            self.output_dir = config.AIRTABLE_OUTPUT_DIR
+            self.sync_interval = config.AIRTABLE_SYNC_INTERVAL
+            self.tables = config.AIRTABLE_TABLES
+            self.rate_limit = config.AIRTABLE_RATE_LIMIT
+            self.error_wait = config.AIRTABLE_ERROR_WAIT
+            self.xai_api_key = config.XAI_API_KEY
+            self.test_mode = config.AIRTABLE_TEST_MODE
 
-class RateLimiter:
-    def __init__(self, calls_per_second: int):
-        self.calls_per_second = calls_per_second
-        self.min_interval = 1.0 / calls_per_second
-        self.last_call_time = 0
+            # Rate limiting setup
+            self.min_interval = 1.0 / self.rate_limit
+            self.last_call_time = 0
 
-    def wait(self):
-        """Wait if necessary to respect the rate limit."""
-        current_time = time.time()
-        time_since_last_call = current_time - self.last_call_time
-        
-        if time_since_last_call < self.min_interval:
-            sleep_time = self.min_interval - time_since_last_call
-            logger.debug(f"Rate limiting: waiting {sleep_time:.3f} seconds")
-            time.sleep(sleep_time)
-        
-        self.last_call_time = time.time()
+            self.api = Api(self.api_key)
+            self.base = self.api.base(self.base_id)
 
-class AirtableFetcher:
-    def __init__(self):
-        # Required environment variables
-        self.api_key = os.getenv('AIRTABLE_API_KEY')
-        self.base_id = os.getenv('AIRTABLE_BASE_ID')
-        self.output_dir = Path(os.getenv('AIRTABLE_OUTPUT_DIR', 'csv_output'))
-        self.sync_interval = int(os.getenv('AIRTABLE_SYNC_INTERVAL', '60'))  # minutes
-        self.tables = os.getenv('AIRTABLE_TABLES', 'Table1,Table2').split(',')
-        self.rate_limit = float(os.getenv('AIRTABLE_RATE_LIMIT', '5'))  # requests per second
-        self.error_wait = int(os.getenv('AIRTABLE_ERROR_WAIT', '35'))  # seconds
-        self.xai_api_key = os.getenv('XAI_API_KEY')
-        self.test_mode = os.getenv('AIRTABLE_TEST_MODE', 'false').lower() in ['1', 'true']
+            self.output_dir.mkdir(exist_ok=True)
 
-        if not self.api_key or not self.base_id:
-            raise ValueError("AIRTABLE_API_KEY and AIRTABLE_BASE_ID must be set in environment")
+        def _wait_for_rate_limit(self):
+            """Wait if necessary to respect the rate limit."""
+            current_time = time.time()
+            time_since_last_call = current_time - self.last_call_time
+            
+            if time_since_last_call < self.min_interval:
+                sleep_time = self.min_interval - time_since_last_call
+                logger.debug(f"Rate limiting: waiting {sleep_time:.3f} seconds")
+                time.sleep(sleep_time)
+            
+            self.last_call_time = time.time()
 
-        self.api = Api(self.api_key)
-        self.base = self.api.base(self.base_id)
-        self.rate_limiter = RateLimiter(self.rate_limit)
-
-    def _make_api_call(self, table_name: str) -> List[List[Dict]]:
-        table = self.base.table(table_name)
-        records = []
-        total_records = 0
-        for page in table.iterate():
-            self.rate_limiter.wait()
-            if self.test_mode:
-                remaining = 3 - total_records
-                if remaining <= 0:
-                    break
-                if len(page) > remaining:
-                    records.append(page[:remaining])
-                    total_records += remaining
-                    break
+        def _make_api_call(self, table_name: str) -> List[List[Dict]]:
+            table = self.base.table(table_name)
+            records = []
+            total_records = 0
+            for page in table.iterate():
+                self._wait_for_rate_limit()
+                if self.test_mode:
+                    remaining = 3 - total_records
+                    if remaining <= 0:
+                        break
+                    if len(page) > remaining:
+                        records.append(page[:remaining])
+                        total_records += remaining
+                        break
+                    else:
+                        records.append(page)
+                        total_records += len(page)
                 else:
                     records.append(page)
-                    total_records += len(page)
-            else:
-                records.append(page)
-        return records
-
-    def get_table_data(self, table_name: str) -> List[List[Dict]]:
-        try:
-            records = self._make_api_call(table_name)
-            logger.debug(f"Fetched records from table {table_name}")
             return records
-        except PyAirtableError as e:
-            logger.warning(f"Airtable API error for table {table_name}: {str(e)}")
-            logger.warning(f"Waiting {self.error_wait} seconds before continuing...")
-            time.sleep(self.error_wait)
-            return []
-        except Exception as e:
-            logger.error(f"Unexpected error fetching data from table {table_name}: {str(e)}")
-            return []
 
-class AirtableExporter:
-    def __init__(self, fetcher: AirtableFetcher):
-        self.fetcher = fetcher
-        self.output_dir = Path(os.getenv('AIRTABLE_OUTPUT_DIR', 'csv_output'))
-        self.xai_api_key = os.getenv('XAI_API_KEY')
+        def get_table_data(self, table_name: str) -> List[List[Dict]]:
+            try:
+                records = self._make_api_call(table_name)
+                logger.debug(f"Fetched records from table {table_name}")
+                return records
+            except PyAirtableError as e:
+                logger.warning(f"Airtable API error for table {table_name}: {str(e)}")
+                logger.warning(f"Waiting {self.error_wait} seconds before continuing...")
+                time.sleep(self.error_wait)
+                return []
+            except Exception as e:
+                logger.error(f"Unexpected error fetching data from table {table_name}: {str(e)}")
+                return []
 
-    def clean_text(self, text: str) -> str:
+    def _clean_text(self, text: str) -> str:
         if not isinstance(text, str):
             return str(text)
         cleaned = re.sub(r'[^a-zA-Z0-9,!?;:\.\'\"\(\)\s@<>_#=+%&~$*\-\/\[\]]', '', text)
         return cleaned
+
+    async def _async_http_get(self, url: str, headers: dict = None, params: dict = None) -> str:
+        """Asynchronously perform an HTTP GET request."""
+        if headers is None:
+            headers = {}
+        if params is None:
+            params = {}
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, headers=headers, params=params)
+                response.raise_for_status()
+                return response.text
+        except Exception as e:
+            logger.warning(f"Async GET request to {url} failed: {e}")
+            return ''
+
+    async def _async_fetch_linkedin_content(self, linkedin_url_list: str) -> str:
+        """Fetch content from LinkedIn URLs using the scraping service."""
+        if not linkedin_url_list:
+            return ''
+        
+        # Parse URLs from the list
+        urls = linkedin_url_list.strip().split('\n')
+        tasks = []
+        for url in urls:
+            headers = {
+                'Content-Type': 'application/json',
+            }
+            params = {
+                'url': f'{url.strip()}',
+                'key': 'scp-live-c119d5158f58442cb5fe56aef9dd659f',
+                'render_js': 'false',
+                'country': 'US',
+                'asp': 'true'
+            }
+            tasks.append(self._async_http_get('https://api.scrapfly.io/scrape', headers=headers, params=params))
+
+        fetched_content = await asyncio.gather(*tasks)
+        return fetched_content
+
+    def _linkedin_xai_summary(self, linkedin_url_list: str, first_name: str = '', last_name: str = '') -> str:
+        xai_api_key = self.xai_api_key
+        if not xai_api_key or not linkedin_url_list:
+            return 'Summary not available.'
+        
+        # Fetch content from LinkedIn URLs
+        fetched_content = asyncio.run(self._async_fetch_linkedin_content(linkedin_url_list))
+        
+        if not fetched_content:
+            return 'Could not fetch LinkedIn content.'
+        
+        try:
+            api_url = 'https://api.x.ai/v1/chat/completions'
+            headers = {
+                'Authorization': f'Bearer {xai_api_key}',
+                'Content-Type': 'application/json',
+            }
+            name_part = f" for {first_name} {last_name}".strip() if first_name or last_name else ''
+            data = {
+                'model': 'grok-3',
+                'messages': [
+                    {'role': 'system', 'content': f'''You are a helpful assistant who summarizes raw linkedin profile information
+                     provided in json format, one json object per each linkedin details page. Be specific in your summary.'''},
+                    {'role': 'user', 'content': f'''summarize information {name_part} from the following json objects:
+                     {fetched_content}.'''}
+                ],
+            }
+            resp = requests.post(api_url, headers=headers, json=data, timeout=90)
+            if resp.status_code == 200:
+                result = resp.json()
+                return result.get('choices', [{}])[0].get('message', {}).get('content', 'Summary not available.')
+            else:
+                logger.warning(f"xAI API error: {resp.status_code} {resp.text}")
+                return 'Summary not available.'
+        except Exception as e:
+            logger.warning(f"Exception calling xAI API: {e}")
+            return 'Summary not available.'
 
     def save_to_csv(self, table_name: str, records_pages: List[List[Dict]]):
         if not records_pages:
@@ -143,7 +213,7 @@ class AirtableExporter:
         all_records = []
         for page in records_pages:
             for record in page:
-                fields = {k: self.clean_text(v) if isinstance(v, (str,list)) else '' for k, v in record['fields'].items()}
+                fields = {k: self._clean_text(v) if isinstance(v, (str,list)) else '' for k, v in record['fields'].items()}
                 fields['airtable_record_id'] = record['id']
                 fields['airtable_table'] = table_name
                 all_records.append(fields)
@@ -167,39 +237,6 @@ class AirtableExporter:
         )
         logger.info(f"Updated {len(all_records)} records in {filename}")
 
-    def linkedin_xai_summary(self, linkedin_url_list: str, first_name: str = '', last_name: str = '') -> str:
-        xai_api_key = self.xai_api_key
-        if not xai_api_key or not linkedin_url_list:
-            return 'Summary not available.'
-        try:
-            api_url = 'https://api.x.ai/v1/chat/completions'
-            headers = {
-                'Authorization': f'Bearer {xai_api_key}',
-                'Content-Type': 'application/json',
-            }
-            name_part = f" for {first_name} {last_name}".strip() if first_name or last_name else ''
-            data = {
-                'model': 'grok-3',
-                'messages': [
-                    {'role': 'system', 'content': f'''You are a helpful assistant that provides context-aware responses
-                     about a person by drawing on linkedin profileinformation from the list of URLs that follow:
-                     {linkedin_url_list}.'''},
-                    {'role': 'user', 'content': f'''summarize professional history, experience, knowledge, education,
-                     and other relevant information {name_part}. You must be specific and detailed. Organize relevant
-                     information into sections.'''}
-                ],
-            }
-            resp = requests.post(api_url, headers=headers, json=data, timeout=90)
-            if resp.status_code == 200:
-                result = resp.json()
-                return result.get('choices', [{}])[0].get('message', {}).get('content', 'Summary not available.')
-            else:
-                logger.warning(f"xAI API error: {resp.status_code} {resp.text}")
-                return 'Summary not available.'
-        except Exception as e:
-            logger.warning(f"Exception calling xAI API: {e}")
-            return 'Summary not available.'
-
     def save_to_plaintext(self, table_name: str, records_pages: List[List[Dict]]):
         if table_name != 'tblgitdXggPeL7cqD':
             return
@@ -209,7 +246,7 @@ class AirtableExporter:
         all_records = []
         for page in records_pages:
             for record in page:
-                fields = {k: self.clean_text(v) if isinstance(v, (str,list)) else '' for k, v in record['fields'].items()}
+                fields = {k: self._clean_text(v) if isinstance(v, (str,list)) else '' for k, v in record['fields'].items()}
                 all_records.append(fields)
         plaintext_content = ""
         for idx, record in enumerate(all_records):
@@ -228,7 +265,7 @@ class AirtableExporter:
                     'details/courses/', 'details/languages/'
                 ]
                 url_list = "\n".join([f"{linkedin_url.rstrip('/')}/{path}" for path in paths])
-                summary = self.linkedin_xai_summary(url_list, first_name, last_name)
+                summary = self._linkedin_xai_summary(url_list, first_name, last_name)
             else:
                 summary = 'No LinkedIn URL provided.'
             plaintext_content += f"### LinkedIn Summary ###\n{summary}\n"
@@ -254,26 +291,27 @@ class AirtableExporter:
         logger.info(f"Sync completed in {duration:.2f} seconds")
 
 def main():
+    config = Config()
+    config.setup_logging()
+    
     try:
-        fetcher = AirtableFetcher()
-        exporter = AirtableExporter(fetcher)
+        exporter = AirtableExporter(config)
 
-        # Log environment variables
-        logger.info(f"Output directory set to: {fetcher.output_dir.absolute()}")
-        logger.info(f"Sync interval set to: {fetcher.sync_interval} minutes")
-        logger.info(f"Tables to sync: {', '.join(fetcher.tables)}")
-        logger.info(f"Rate limit set to: {fetcher.rate_limit} requests per second")
-        logger.info(f"Error wait time set to: {fetcher.error_wait} seconds")
-        logger.info(f"Test mode: {'ENABLED' if fetcher.test_mode else 'disabled'}")
-        if not fetcher.xai_api_key:
-            logger.warning('XAI_API_KEY not set. LinkedIn summaries will be skipped.')
+        # Log configuration
+        config.log_configuration()
         
+        # Wrapper function for the scheduler to run the sync_all_tables function
+        def run():
+            exporter.sync_all_tables()
+        schedule.every(config.AIRTABLE_SYNC_INTERVAL).minutes.do(run)
+        
+        # Run the sync_all_tables function once to ensure all tables are synced
         exporter.sync_all_tables()
-        schedule.every(fetcher.sync_interval).minutes.do(exporter.sync_all_tables)
-        logger.info(f"Starting sync service with {fetcher.sync_interval} minute interval...")
+        
+        logger.info(f"Starting sync service with {config.AIRTABLE_SYNC_INTERVAL} minute interval...")
         while True:
             schedule.run_pending()
-            time.sleep(60)
+            time.sleep(config.AIRTABLE_SYNC_INTERVAL * 60)
     except Exception as e:
         logger.error(f"Fatal error: {str(e)}")
         raise
